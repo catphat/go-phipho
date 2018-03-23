@@ -1,167 +1,177 @@
 package phipho
 
 import (
+	"bytes"
 	"fmt"
 	"os"
-	"path"
 	"path/filepath"
-	"strconv"
 	"syscall"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/pkg/errors"
-	"github.com/rjeczalik/notify"
+	sys "golang.org/x/sys/unix"
 )
 
-// Fifo represents a named mkfifo pipe
-type Fifo struct {
-	Name  string
-	Event chan FifoEvent
+type Fi interface {
+	In(b []byte) (n int, err error)
 }
 
-type FifoEvent struct {
-	Type string
-	Info string
+type Fo interface {
+	Out(<-chan []byte) (err error)
 }
 
-func (f *Fifo) New(name string) (err error) {
-	f.Name = name
-	dir := path.Dir(".") //todo this should be an argument
-	abs, err := filepath.Abs(path.Join(dir, name))
+// named pipe
+type np struct {
+	name      string // mkfifo file path
+	events    <-chan string
+	eventsErr <-chan error
+}
+
+func newNp(npPath string) (*np, error) {
+	np := &np{}
+	err := np.initNp("./fifo/testfifo")
+	return np, err
+}
+
+func (p *np) initNp(npPath string) (err error) {
+	p.name = npPath
+	err = p.initPipe()
 	if err != nil {
-		return errors.Wrap(err, "could not get absolute path")
+		return errors.Wrap(err, "could not init pipe")
 	}
+	p.events, p.eventsErr, err = p.initEvents()
+	return err
+}
 
-	err = syscall.Mkfifo(f.Name, 0600)
+func (p *np) initPipe() error {
+	err := sys.Mkfifo(p.name, 0600)
 	if err != nil {
-		return errors.Wrap(err, "could not create mkfifo pipe")
+		return errors.Wrap(err, "could not create pipe")
 	}
-
-	ec := make(chan notify.EventInfo, 4)
-	if err = notify.Watch(dir, ec, notify.All); err != nil {
-		fmt.Println(err)
-		return errors.Wrap(err, "could not watch fifo file.")
-	}
-
-	f.Event = make(chan FifoEvent, 4)
-
-	go func() {
-		for {
-			ei := <-ec
-
-			if ei.Path() != abs {
-				continue
-			}
-			fmt.Println(ei)
-			f.Event <- FifoEvent{
-				Type: fmt.Sprintf("%s", ei.Event()),
-				Info: ei.Path(),
-			}
-			if ei.Event() == notify.Remove {
-				defer notify.Stop(ec)
-				defer close(f.Event)
-				fmt.Println("stopped ec....")
-				break
-			}
-		}
-	}()
-
-	//	for {
-	//		fmt.Println("waiting for events...")
-	//		event := <-f.Event
-	//		fmt.Println(event)
-	//	}
 	return nil
 }
 
-func (f *Fifo) getExistingFifoFileRO() (file *os.File, err error) {
-	file, err = getExistingFifoFile(f.Name, syscall.O_NONBLOCK|syscall.O_RDONLY|syscall.O_EXCL)
+func (p *np) initEvents() (ec <-chan string, erc <-chan error, err error) {
+	events := make(chan string, 1)
+	eventsErr := make(chan error, 1)
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return events, eventsErr, errors.Wrap(err, "could not create new watcher")
+	}
+
+	go func() {
+		done := false
+		for !done {
+			select {
+			case e := <-watcher.Events:
+				eAbs, err := filepath.Abs(e.Name)
+				if err != nil {
+					eventsErr <- errors.Wrap(err, "fs notify event error")
+				}
+
+				pAbs, err := filepath.Abs(p.name)
+				if err != nil {
+					eventsErr <- errors.Wrap(err, "could get named pipe absolute path")
+				}
+
+				if eAbs != pAbs {
+					continue
+				}
+				fmt.Println(e)
+				events <- e.Op.String()
+			case err := <-watcher.Errors:
+				eventsErr <- errors.Wrap(err, "fs notify error")
+			}
+		}
+	}()
+
+	path, _ := filepath.Split(p.name)
+	err = watcher.Add(path)
+	if err != nil {
+		err = errors.Wrapf(err, "could not add dir %v to watcher", path)
+	}
+
+	return events, eventsErr, err
+}
+
+func (p *np) writeln(s string) error {
+	f, err := p.getPipeWO()
+	if err != nil {
+		return errors.Wrap(err, "could not get pipe for write only")
+	}
+	defer f.Close()
+
+	_, err = f.WriteString(fmt.Sprintf("%v\n", s))
+	return err
+}
+
+func (p *np) read() (out <-chan string, err error) {
+	oc := make(chan string, 1)
+	f, err := p.getPipeRO()
+	if err != nil {
+		return nil, errors.Wrap(err, "could not get pipe for read only")
+	}
+	go func() {
+		for {
+			e := <-p.events
+			switch e {
+			case "WRITE":
+				b := new(bytes.Buffer)
+				b.ReadFrom(f)
+				oc <- b.String()
+			}
+		}
+	}()
+
+	return oc, nil
+}
+
+func (p *np) getPipeRO() (f *os.File, err error) {
+	f, err = p.getPipe(sys.O_NONBLOCK | sys.O_RDONLY | sys.O_EXCL)
 	if err != nil {
 		return nil, errors.Wrap(err, "could not get existing fifo file")
 	}
-	return file, nil
+	return f, nil
 }
 
-func (f *Fifo) getExistingFifoFileWO() (file *os.File, err error) {
-	// If O_NONBLOCK is set,  an open() for writing only will return an error
-	// if no process currently has the file open for reading.
-	file, err = getExistingFifoFile(f.Name, syscall.O_NONBLOCK|syscall.O_WRONLY)
+// If O_NONBLOCK is set,  an open() for writing only will return an error
+// if no process currently has the file open for reading.
+// http://pubs.opengroup.org/onlinepubs/7908799/xsh/open.html
+func (p *np) getPipeWO() (f *os.File, err error) {
+	f, err = p.getPipe(syscall.O_APPEND | syscall.O_WRONLY)
 	if err != nil {
 		return nil, errors.Wrap(err, "could not get existing fifo file")
 	}
-	return file, nil
+	return f, nil
 }
 
-func getExistingFifoFile(name string, fileflags int) (file *os.File, err error) {
+func (p *np) getPipe(fileflags int) (file *os.File, err error) {
 	fc := make(chan *os.File, 1)
 	errc := make(chan error, 1)
-	go func() {
+	defer close(fc)
+	defer close(errc)
 
-		// http://pubs.opengroup.org/onlinepubs/007908799/xsh/open.html (O_NONBLOCK)
-		// syscall.O_NONBLOCK
-		if file, err = os.OpenFile(name, fileflags, os.ModeNamedPipe); os.IsNotExist(err) {
+	go func() {
+		if file, err = os.OpenFile(p.name, fileflags, os.ModeNamedPipe); os.IsNotExist(err) {
 			errc <- errors.Wrap(err, "Named pipe does not exist")
 			return
 		} else if os.IsPermission(err) {
-			errc <- errors.Wrap(err, fmt.Sprintf("Insufficient permissions to read named pipe '%s'", name))
+			errc <- errors.Wrapf(err, "Insufficient permissions to read named pipe '%s'", p.name)
 			return
 		} else if err != nil {
-			errc <- errors.Wrap(err, fmt.Sprintf("Error while opening named pipe '%s'", name))
+			errc <- errors.Wrapf(err, "Error while opening named pipe '%s'", p.name)
 			return
 		}
 		fc <- file
-
-	}()
-
-	timeout := make(chan bool, 1)
-	go func() {
-		time.Sleep(time.Millisecond * 100)
-		timeout <- true
 	}()
 
 	select {
 	case err := <-errc:
 		return nil, err
-	case <-timeout:
+	case <-time.After(time.Millisecond * 100):
 		return nil, errors.New("timeout while getting existing fifo file")
 	case <-fc:
 		return file, nil
 	}
-}
-
-func (f *Fifo) write(b []byte) error {
-	file, err := f.getExistingFifoFileWO()
-	if err != nil {
-		return errors.Wrap(err, "failed openening fifo file")
-	}
-	defer file.Close()
-	_, err = file.Write(b)
-	if err != nil {
-		return errors.Wrap(err, "failed writing to fifo file")
-	}
-	return nil
-}
-
-// Append write with newline
-func (f *Fifo) writeln(b []byte) error {
-	b = append(b, byte(10))
-	return f.write(b)
-}
-
-func (f *Fifo) sendStringMsg(msg string) error {
-	return f.writeln([]byte(msg))
-}
-
-func (f *Fifo) sendIntMsg(msg int) error {
-	strMsg := strconv.FormatInt(int64(msg), 10)
-	return f.sendStringMsg(strMsg)
-}
-
-func (f *Fifo) Destroy() error {
-	err := os.Remove(f.Name)
-	if err != nil {
-		return errors.Wrap(err, "could not remove file")
-	}
-	return nil
-
 }
