@@ -8,95 +8,142 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/pkg/errors"
 	sys "golang.org/x/sys/unix"
 )
 
-type Fi interface {
-	In(b []byte) (n int, err error)
+// conventions:
+// - If a method mutates the state of an existing struct, then it should be a pointer extension
+//   TODO - get golang naming convention for "pointer extension"
+
+// named pipe name
+type name string
+
+func (n *name) string() string {
+	return fmt.Sprintf("%v", n)
 }
 
-type Fo interface {
-	Out(<-chan []byte) (err error)
+func (n *name) getAbsPath() (p string, err error) {
+	p, err = filepath.Abs(n.string())
+	if err != nil {
+		err = errors.Wrapf(err, "could not get absolute path of %v", n)
+	}
+	return p, err
+}
+
+func (n *name) getParentDir() (pd string, err error) {
+	p, err := n.getAbsPath()
+	if err != nil {
+		return p, errors.Wrap(err, "could not get path")
+	}
+
+	pd, _ = filepath.Split(p)
+	return p, nil
 }
 
 // named pipe
 type np struct {
-	name      string // mkfifo file path
-	events    <-chan string
-	eventsErr <-chan error
+	n name // mkfifo filepath/name, if nil then a default value will be used (pid)
+	e *fsEvents
+	//weh *pipeWriteEventHandler //fs WRITE event handler, if nil then default handler will be used
+	//eeh *pipeErrorEventHandler //fs error event handler, if nil then default handler will be used
 }
 
-func newNp(npPath string) (*np, error) {
+func newNp(opts ...option) (*np, error) {
 	np := &np{}
-	err := np.initNp("./fifo/testfifo")
+	np.Options(opts)
+	err := np.n.initPipe()
+	if err != nil {
+		return nil, errors.Wrap(err, "could not initialize pipe")
+	}
+	p, err := np.n.getParentDir()
+	if err != nil {
+		return nil, errors.Wrapf(err, "could not get parent dir of %v", np.n)
+	}
+	e, err := newFsEvents(np.n.string(), p)
+	if err != nil {
+		return nil, errors.Wrap(err, "could create new File Systems Event watcher")
+	}
+	np.e = e
 	return np, err
 }
 
-func (p *np) initNp(npPath string) (err error) {
-	p.name = npPath
-	err = p.initPipe()
-	if err != nil {
-		return errors.Wrap(err, "could not init pipe")
-	}
-	p.events, p.eventsErr, err = p.initEvents()
-	return err
-}
-
-func (p *np) initPipe() error {
-	err := sys.Mkfifo(p.name, 0600)
+func (n *name) initPipe() (err error) {
+	err = sys.Mkfifo(n.string(), 0600)
 	if err != nil {
 		return errors.Wrap(err, "could not create pipe")
 	}
 	return nil
 }
 
-func (p *np) initEvents() (ec <-chan string, erc <-chan error, err error) {
-	events := make(chan string, 1)
-	eventsErr := make(chan error, 1)
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return events, eventsErr, errors.Wrap(err, "could not create new watcher")
+type option func(*np)
+
+func (np *np) Options(opts []option) {
+	for _, opt := range opts {
+		np.Option(opt)
 	}
-
-	go func() {
-		done := false
-		for !done {
-			select {
-			case e := <-watcher.Events:
-				eAbs, err := filepath.Abs(e.Name)
-				if err != nil {
-					eventsErr <- errors.Wrap(err, "fs notify event error")
-				}
-
-				pAbs, err := filepath.Abs(p.name)
-				if err != nil {
-					eventsErr <- errors.Wrap(err, "could get named pipe absolute path")
-				}
-
-				if eAbs != pAbs {
-					continue
-				}
-				fmt.Println(e)
-				events <- e.Op.String()
-			case err := <-watcher.Errors:
-				eventsErr <- errors.Wrap(err, "fs notify error")
-			}
-		}
-	}()
-
-	path, _ := filepath.Split(p.name)
-	err = watcher.Add(path)
-	if err != nil {
-		err = errors.Wrapf(err, "could not add dir %v to watcher", path)
-	}
-
-	return events, eventsErr, err
 }
 
+func (np *np) Option(opts ...option) {
+	for _, opt := range opts {
+		opt(np)
+	}
+}
+
+func Name(fileName string) option {
+	return func(np *np) {
+		np.n = name(fileName)
+	}
+}
+
+type pipeFileReader interface {
+	read(n *name, stop <-chan bool) (out <-chan string, err error)
+}
+
+func readFromFile(n *name, stop <-chan bool) (out <-chan string, err error) {
+	oc := make(chan string, 1)
+	f, err := n.getPipeRO()
+	if err != nil {
+		return nil, errors.Wrap(err, "could not get file for read only")
+	}
+	go func() {
+		select {
+		case <-stop:
+			f.Close()
+			close(oc)
+			return
+		default:
+			b := new(bytes.Buffer)
+			b.ReadFrom(f)
+			oc <- b.String()
+		}
+	}()
+	return oc, nil
+}
+
+//func (p *np) read() (out <-chan string, err error) {
+//	oc := make(chan string, 1)
+//	f, err := p.n.getPipeRO()
+//	if err != nil {
+//		return nil, errors.Wrap(err, "could not get pipe for read only")
+//	}
+//	go func() {
+//		for {
+//			e := <-p.e.c
+//			switch e {
+//			case "WRITE":
+//				b := new(bytes.Buffer)
+//				b.ReadFrom(f)
+//				oc <- b.String()
+//			}
+//		}
+//	}()
+//
+//	return oc, nil
+//}
+
 func (p *np) writeln(s string) error {
-	f, err := p.getPipeWO()
+	f, err := p.n.getPipeWO()
 	if err != nil {
 		return errors.Wrap(err, "could not get pipe for write only")
 	}
@@ -106,29 +153,8 @@ func (p *np) writeln(s string) error {
 	return err
 }
 
-func (p *np) read() (out <-chan string, err error) {
-	oc := make(chan string, 1)
-	f, err := p.getPipeRO()
-	if err != nil {
-		return nil, errors.Wrap(err, "could not get pipe for read only")
-	}
-	go func() {
-		for {
-			e := <-p.events
-			switch e {
-			case "WRITE":
-				b := new(bytes.Buffer)
-				b.ReadFrom(f)
-				oc <- b.String()
-			}
-		}
-	}()
-
-	return oc, nil
-}
-
-func (p *np) getPipeRO() (f *os.File, err error) {
-	f, err = p.getPipe(sys.O_NONBLOCK | sys.O_RDONLY | sys.O_EXCL)
+func (n *name) getPipeRO() (f *os.File, err error) {
+	f, err = n.getPipe(sys.O_NONBLOCK | sys.O_RDONLY | sys.O_EXCL)
 	if err != nil {
 		return nil, errors.Wrap(err, "could not get existing fifo file")
 	}
@@ -138,29 +164,34 @@ func (p *np) getPipeRO() (f *os.File, err error) {
 // If O_NONBLOCK is set,  an open() for writing only will return an error
 // if no process currently has the file open for reading.
 // http://pubs.opengroup.org/onlinepubs/7908799/xsh/open.html
-func (p *np) getPipeWO() (f *os.File, err error) {
-	f, err = p.getPipe(syscall.O_APPEND | syscall.O_WRONLY)
+func (n *name) getPipeWO() (f *os.File, err error) {
+	f, err = n.getPipe(syscall.O_APPEND | syscall.O_WRONLY)
 	if err != nil {
 		return nil, errors.Wrap(err, "could not get existing fifo file")
 	}
 	return f, nil
 }
 
-func (p *np) getPipe(fileflags int) (file *os.File, err error) {
+func (n *name) getPipe(fileflags int) (file *os.File, err error) {
 	fc := make(chan *os.File, 1)
 	errc := make(chan error, 1)
 	defer close(fc)
 	defer close(errc)
 
 	go func() {
-		if file, err = os.OpenFile(p.name, fileflags, os.ModeNamedPipe); os.IsNotExist(err) {
+		fp, err := n.getAbsPath()
+		if err != nil {
+			errc <- errors.Wrap(err, "could not get pipe absolute path")
+			return
+		}
+		if file, err = os.OpenFile(fp, fileflags, os.ModeNamedPipe); os.IsNotExist(err) {
 			errc <- errors.Wrap(err, "Named pipe does not exist")
 			return
 		} else if os.IsPermission(err) {
-			errc <- errors.Wrapf(err, "Insufficient permissions to read named pipe '%s'", p.name)
+			errc <- errors.Wrapf(err, "Insufficient permissions to read named pipe '%s'", n)
 			return
 		} else if err != nil {
-			errc <- errors.Wrapf(err, "Error while opening named pipe '%s'", p.name)
+			errc <- errors.Wrapf(err, "Error while opening named pipe '%s'", n)
 			return
 		}
 		fc <- file

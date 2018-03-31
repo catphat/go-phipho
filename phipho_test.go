@@ -8,18 +8,22 @@ import (
 
 func TestFifo(t *testing.T) {
 
-	np, err := newNp("./fifo/testfifo")
+	np, err := newNp(
+		Name("./fifo/testfifo"),
+		//WriteEventHandler(nil),
+		//ErrorEventHandler(nil),
+	)
+
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.Remove("./fifo/testfifo")
 
-	out, err := np.read()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	fmt.Println("reading")
+	//	out, err := np.read()
+	//	if err != nil {
+	//		t.Fatal(err)
+	//	}
+	// fmt.Println("reading")
 
 	err = np.writeln("moi kaikki")
 	if err != nil {
@@ -28,9 +32,9 @@ func TestFifo(t *testing.T) {
 
 	fmt.Println("wrote hello")
 
-	for s := range out {
-		fmt.Println(s)
-	}
+	//for s := range out {
+	//	fmt.Println(s)
+	//}
 }
 
 //func testNewFifo(t *testing.T, f *Fifo, name string) {
