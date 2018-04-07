@@ -25,7 +25,7 @@ func TestFifo(t *testing.T) {
 	//	}
 	// fmt.Println("reading")
 
-	err = np.writeln("moi kaikki")
+	err = np.writeln("moi kaikki", false)
 	if err != nil {
 		t.Fatal(err)
 	}

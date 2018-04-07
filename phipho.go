@@ -3,13 +3,8 @@ package phipho
 import (
 	"bytes"
 	"fmt"
-	"os"
-	"path/filepath"
-	"syscall"
-	"time"
 
 	"github.com/pkg/errors"
-	sys "golang.org/x/sys/unix"
 )
 
 // conventions:
@@ -20,25 +15,7 @@ import (
 type name string
 
 func (n *name) string() string {
-	return fmt.Sprintf("%v", n)
-}
-
-func (n *name) getAbsPath() (p string, err error) {
-	p, err = filepath.Abs(n.string())
-	if err != nil {
-		err = errors.Wrapf(err, "could not get absolute path of %v", n)
-	}
-	return p, err
-}
-
-func (n *name) getParentDir() (pd string, err error) {
-	p, err := n.getAbsPath()
-	if err != nil {
-		return p, errors.Wrap(err, "could not get path")
-	}
-
-	pd, _ = filepath.Split(p)
-	return p, nil
+	return fmt.Sprintf("%v", *n)
 }
 
 // named pipe
@@ -52,7 +29,7 @@ type np struct {
 func newNp(opts ...option) (*np, error) {
 	np := &np{}
 	np.Options(opts)
-	err := np.n.initPipe()
+	err := np.n.makePipe()
 	if err != nil {
 		return nil, errors.Wrap(err, "could not initialize pipe")
 	}
@@ -66,14 +43,6 @@ func newNp(opts ...option) (*np, error) {
 	}
 	np.e = e
 	return np, err
-}
-
-func (n *name) initPipe() (err error) {
-	err = sys.Mkfifo(n.string(), 0600)
-	if err != nil {
-		return errors.Wrap(err, "could not create pipe")
-	}
-	return nil
 }
 
 type option func(*np)
@@ -102,7 +71,7 @@ type pipeFileReader interface {
 
 func readFromFile(n *name, stop <-chan bool) (out <-chan string, err error) {
 	oc := make(chan string, 1)
-	f, err := n.getPipeRO()
+	f, err := n.getPipeRO(false)
 	if err != nil {
 		return nil, errors.Wrap(err, "could not get file for read only")
 	}
@@ -141,68 +110,3 @@ func readFromFile(n *name, stop <-chan bool) (out <-chan string, err error) {
 //
 //	return oc, nil
 //}
-
-func (p *np) writeln(s string) error {
-	f, err := p.n.getPipeWO()
-	if err != nil {
-		return errors.Wrap(err, "could not get pipe for write only")
-	}
-	defer f.Close()
-
-	_, err = f.WriteString(fmt.Sprintf("%v\n", s))
-	return err
-}
-
-func (n *name) getPipeRO() (f *os.File, err error) {
-	f, err = n.getPipe(sys.O_NONBLOCK | sys.O_RDONLY | sys.O_EXCL)
-	if err != nil {
-		return nil, errors.Wrap(err, "could not get existing fifo file")
-	}
-	return f, nil
-}
-
-// If O_NONBLOCK is set,  an open() for writing only will return an error
-// if no process currently has the file open for reading.
-// http://pubs.opengroup.org/onlinepubs/7908799/xsh/open.html
-func (n *name) getPipeWO() (f *os.File, err error) {
-	f, err = n.getPipe(syscall.O_APPEND | syscall.O_WRONLY)
-	if err != nil {
-		return nil, errors.Wrap(err, "could not get existing fifo file")
-	}
-	return f, nil
-}
-
-func (n *name) getPipe(fileflags int) (file *os.File, err error) {
-	fc := make(chan *os.File, 1)
-	errc := make(chan error, 1)
-	defer close(fc)
-	defer close(errc)
-
-	go func() {
-		fp, err := n.getAbsPath()
-		if err != nil {
-			errc <- errors.Wrap(err, "could not get pipe absolute path")
-			return
-		}
-		if file, err = os.OpenFile(fp, fileflags, os.ModeNamedPipe); os.IsNotExist(err) {
-			errc <- errors.Wrap(err, "Named pipe does not exist")
-			return
-		} else if os.IsPermission(err) {
-			errc <- errors.Wrapf(err, "Insufficient permissions to read named pipe '%s'", n)
-			return
-		} else if err != nil {
-			errc <- errors.Wrapf(err, "Error while opening named pipe '%s'", n)
-			return
-		}
-		fc <- file
-	}()
-
-	select {
-	case err := <-errc:
-		return nil, err
-	case <-time.After(time.Millisecond * 100):
-		return nil, errors.New("timeout while getting existing fifo file")
-	case <-fc:
-		return file, nil
-	}
-}

@@ -100,21 +100,6 @@ func (fse *fsEvents) init(fn string, p string) (err error) {
 				}
 				fmt.Printf("event %v\n", fse)
 				ec <- fse
-				//eAbs, err := filepath.Abs(fse.Name)
-				//if err != nil {
-				//	erc <- errors.Wrap(err, "fs notify event error")
-				//}
-
-				//pAbs, err := n.getAbsPath()
-				//if err != nil {
-				//	erc <- errors.Wrap(err, "could get not named pipe path")
-				//}
-
-				//if eAbs != pAbs {
-				//	continue
-				//}
-				//fmt.Println(fse)
-				//ec <- fse.Op.String()
 
 			case err := <-watcher.Errors:
 				erc <- errors.Wrap(err, "fs notify error")
@@ -149,8 +134,8 @@ func (fse *fsEvents) init(fn string, p string) (err error) {
 		return errors.Wrapf(err, "could not add dir %v to watcher", p)
 	}
 
-	fse.c = ec
-	fse.ec = erc
+	//	fse.c = ec
+	//	fse.ec = erc
 	return nil
 }
 
